@@ -1,17 +1,33 @@
+# torch
+# accelerate
+# opencv-python
+# spaces
+# pillow
+# numpy
+# timm
+# kornia
+# prettytable
+# typing
+# scikit-image
+# huggingface_hub
+vtransformers>=4.39.1
+# gradio
+# gradio_imageslider
+# loadimg>=0.1.1
+# einops
+streamlit
 torch
+transformers>=4.39.1
+Pillow
+loadimg>=0.1.1  # Ensure this is pip-installable or provide the library
+numpy
 accelerate
 opencv-python
-spaces
-pillow
-numpy
 timm
 kornia
-prettytable
-typing
+# prettytable # Likely not needed for Streamlit UI
+# typing # Built-in, not needed in requirements.txt
 scikit-image
 huggingface_hub
-transformers>=4.39.1
-gradio
-gradio_imageslider
-loadimg>=0.1.1
 einops
+# requests # Add if you implement the URL loading alternative for load_img
