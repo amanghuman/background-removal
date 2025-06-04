@@ -1,18 +1,50 @@
-import gradio as gr
-from loadimg import load_img
-import spaces
-from transformers import AutoModelForImageSegmentation
+import streamlit as st
+from PIL import Image
 import torch
 from torchvision import transforms
+from transformers import AutoModelForImageSegmentation
 from typing import Union, Tuple
-from PIL import Image
+import io
+
+# Assuming 'loadimg' is a pip-installable library as in your original requirements
+# If not, its functionality (loading image from path/URL to PIL) needs to be ensured.
+# For example, using:
+# from PIL import Image
+# import requests
+# from io import BytesIO
+# def load_img_alternative(path_or_url, output_type="pil"):
+#     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+#         response = requests.get(path_or_url)
+#         response.raise_for_status()
+#         img = Image.open(BytesIO(response.content))
+#     else:
+#         img = Image.open(path_or_url)
+#     if output_type == "pil":
+#         return img.convert("RGB") if img.mode != 'RGB' else img
+#     # Add other output_type handling if needed
+#     return img
+
+# Using the original load_img, ensure it's in your environment
+try:
+    from loadimg import load_img
+except ImportError:
+    st.error("The 'loadimg' library is not installed. Please add it to your requirements.txt or ensure it's available.")
+    st.stop() # Stop execution if loadimg is not found
+
+
+# --- Model Loading and Configuration ---
+@st.cache_resource # Cache the model resource across reruns
+def load_model():
+    """Loads the BiRefNet model and moves it to the appropriate device."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForImageSegmentation.from_pretrained(
+        "ZhengPeng7/BiRefNet", trust_remote_code=True
+    )
+    model.to(device)
+    return model, device
 
 torch.set_float32_matmul_precision(["high", "highest"][0])
-
-birefnet = AutoModelForImageSegmentation.from_pretrained(
-    "ZhengPeng7/BiRefNet", trust_remote_code=True
-)
-birefnet.to("cuda")
+birefnet, device = load_model()
 
 transform_image = transforms.Compose(
     [
@@ -22,88 +54,155 @@ transform_image = transforms.Compose(
     ]
 )
 
-def fn(image: Union[Image.Image, str]) -> Tuple[Image.Image, Image.Image]:
-    """
-    Remove the background from an image and return both the transparent version and the original.
-
-    This function performs background removal using a BiRefNet segmentation model. It is intended for use
-    with image input (either uploaded or from a URL). The function returns a transparent PNG version of the image
-    with the background removed, along with the original RGB version for comparison.
-
-    Args:
-        image (PIL.Image or str): The input image, either as a PIL object or a filepath/URL string.
-
-    Returns:
-        tuple:
-            - processed_image (PIL.Image): The input image with the background removed and transparency applied.
-            - origin (PIL.Image): The original RGB image, unchanged.
-    """
-    im = load_img(image, output_type="pil")
-    im = im.convert("RGB")
-    origin = im.copy()
-    processed_image = process(im)
-    return (processed_image, origin)
-
-@spaces.GPU
-def process(image: Image.Image) -> Image.Image:
+# --- Core Processing Functions ---
+def process_image_core(image: Image.Image) -> Image.Image:
     """
     Apply BiRefNet-based image segmentation to remove the background.
-
-    This function preprocesses the input image, runs it through a BiRefNet segmentation model to obtain a mask,
-    and applies the mask as an alpha (transparency) channel to the original image.
-
     Args:
         image (PIL.Image): The input RGB image.
-
     Returns:
         PIL.Image: The image with the background removed, using the segmentation mask as transparency.
     """
     image_size = image.size
-    input_images = transform_image(image).unsqueeze(0).to("cuda")
-    # Prediction
+    # Ensure image is RGB before transform
+    input_img_rgb = image.convert("RGB")
+    input_tensor = transform_image(input_img_rgb).unsqueeze(0).to(device)
+
     with torch.no_grad():
-        preds = birefnet(input_images)[-1].sigmoid().cpu()
-    pred = preds[0].squeeze()
-    pred_pil = transforms.ToPILImage()(pred)
-    mask = pred_pil.resize(image_size)
-    image.putalpha(mask)
-    return image
+        preds = birefnet(input_tensor)[-1].sigmoid().cpu()
+    pred_mask_tensor = preds[0].squeeze()
+    
+    pred_pil_mask = transforms.ToPILImage()(pred_mask_tensor)
+    mask_resized = pred_pil_mask.resize(image_size, Image.LANCZOS) # Use LANCZOS for better quality resize
 
-def process_file(f: str) -> str:
+    # Create a copy to put alpha to avoid modifying the original if it's from cache or input
+    output_image = image.copy()
+    if output_image.mode != 'RGBA':
+        output_image = output_image.convert('RGBA') # Ensure image is RGBA to accept alpha
+    
+    output_image.putalpha(mask_resized)
+    return output_image
+
+def fn_streamlit(image_input: Union[Image.Image, str]) -> Tuple[Image.Image, Image.Image]:
     """
-    Load an image file from disk, remove the background, and save the output as a transparent PNG.
-
+    Remove background for Streamlit app.
     Args:
-        f (str): Filepath of the image to process.
-
+        image_input (PIL.Image or str): PIL image or path/URL.
     Returns:
-        str: Path to the saved PNG image with background removed.
+        tuple: (processed_image, original_image)
     """
-    name_path = f.rsplit(".", 1)[0] + ".png"
-    im = load_img(f, output_type="pil")
-    im = im.convert("RGB")
-    transparent = process(im)
-    transparent.save(name_path)
-    return name_path
+    if isinstance(image_input, str): # If it's a path or URL
+        im = load_img(image_input, output_type="pil")
+    else: # If it's already a PIL image
+        im = image_input
+    
+    original_rgb = im.convert("RGB") # Keep a clean RGB version of the original
+    processed_image = process_image_core(original_rgb.copy()) # Process a copy
+    return processed_image, original_rgb
 
-slider1 = gr.ImageSlider(label="Processed Image", type="pil", format="png")
-slider2 = gr.ImageSlider(label="Processed Image from URL", type="pil", format="png")
-image_upload = gr.Image(label="Upload an image")
-image_file_upload = gr.Image(label="Upload an image", type="filepath")
-url_input = gr.Textbox(label="Paste an image URL")
-output_file = gr.File(label="Output PNG File")
+# --- Streamlit UI ---
+st.title("Background Removal Tool")
 
-# Example images
-chameleon = load_img("butterfly.jpg", output_type="pil")
-url_example = "https://hips.hearstapps.com/hmg-prod/images/gettyimages-1229892983-square.jpg"
+tab1, tab2, tab3 = st.tabs(["Upload Image", "Process from URL", "Upload & Download PNG"])
 
-tab1 = gr.Interface(fn, inputs=image_upload, outputs=slider1, examples=[chameleon], api_name="image")
-tab2 = gr.Interface(fn, inputs=url_input, outputs=slider2, examples=[url_example], api_name="text")
-tab3 = gr.Interface(process_file, inputs=image_file_upload, outputs=output_file, examples=["butterfly.jpg"], api_name="png")
+# --- Tab 1: Image Upload ---
+with tab1:
+    st.header("Upload an Image")
+    uploaded_file = st.file_uploader("Choose an image...", type=["png", "jpg", "jpeg"])
+    
+    if uploaded_file is not None:
+        input_image_pil = Image.open(uploaded_file)
+        
+        with st.spinner("Processing image..."):
+            processed_image, original_image = fn_streamlit(input_image_pil)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Original Image")
+            st.image(original_image, use_column_width=True)
+        with col2:
+            st.subheader("Background Removed")
+            st.image(processed_image, use_column_width=True)
 
-demo = gr.TabbedInterface(
-    [tab1, tab2, tab3], ["Image Upload", "URL Input", "File Output"], title="Background Removal Tool"
-)
+            # Download button for processed image
+            buf = io.BytesIO()
+            processed_image.save(buf, format="PNG")
+            byte_im = buf.getvalue()
+            st.download_button(
+                label="Download Processed PNG",
+                data=byte_im,
+                file_name=f"bg_removed_{uploaded_file.name.split('.')[0]}.png",
+                mime="image/png"
+            )
 
-if __name__ == "__main__":
-    demo.launch(show_error=True, mcp_server=True)
+# --- Tab 2: URL Input ---
+with tab2:
+    st.header("Process Image from URL")
+    url_example = "https://hips.hearstapps.com/hmg-prod/images/gettyimages-1229892983-square.jpg" #
+    url = st.text_input("Enter image URL:", value=url_example)
+
+    if url and st.button("Process from URL"):
+        try:
+            with st.spinner("Loading and processing image from URL..."):
+                # load_img should handle URL, if not, use requests+PIL alternative shown in comments
+                input_image_from_url = load_img(url, output_type="pil")
+                processed_image_url, original_image_url = fn_streamlit(input_image_from_url)
+            
+            col1_url, col2_url = st.columns(2)
+            with col1_url:
+                st.subheader("Original Image")
+                st.image(original_image_url, use_column_width=True)
+            with col2_url:
+                st.subheader("Background Removed")
+                st.image(processed_image_url, use_column_width=True)
+
+                # Download button
+                buf_url = io.BytesIO()
+                processed_image_url.save(buf_url, format="PNG")
+                byte_im_url = buf_url.getvalue()
+                st.download_button(
+                    label="Download Processed PNG",
+                    data=byte_im_url,
+                    file_name="bg_removed_from_url.png",
+                    mime="image/png"
+                )
+        except Exception as e:
+            st.error(f"Error processing URL: {e}")
+            st.error("Please ensure the URL points directly to an image file (e.g., .jpg, .png).")
+
+# --- Tab 3: File Output (Upload, Process, Download) ---
+with tab3:
+    st.header("Upload Image for Direct PNG Download")
+    uploaded_file_direct = st.file_uploader("Upload image file...", type=["png", "jpg", "jpeg"], key="direct_upload")
+
+    if uploaded_file_direct is not None:
+        input_image_direct_pil = Image.open(uploaded_file_direct)
+        
+        with st.spinner("Processing for download..."):
+            # The original process_file function saved to disk.
+            # Here, we'll process and offer for download directly.
+            # Ensure input_image_direct_pil is RGB for processing
+            img_rgb = input_image_direct_pil.convert("RGB")
+            transparent_image = process_image_core(img_rgb)
+
+        st.subheader("Processed Image Preview")
+        st.image(transparent_image, use_column_width=True, caption="Background Removed")
+
+        buf_direct = io.BytesIO()
+        transparent_image.save(buf_direct, format="PNG")
+        byte_im_direct = buf_direct.getvalue()
+        
+        st.download_button(
+            label="Download Processed PNG File",
+            data=byte_im_direct,
+            file_name=f"processed_{uploaded_file_direct.name.split('.')[0]}.png",
+            mime="image/png"
+        )
+
+st.markdown("---")
+st.markdown("Powered by BiRefNet and Streamlit.")
+
+# To run this app:
+# 1. Save as app_st.py (or any other .py name)
+# 2. Ensure all dependencies from the updated requirements.txt are installed.
+# 3. Run `streamlit run app_st.py` in your terminal.
