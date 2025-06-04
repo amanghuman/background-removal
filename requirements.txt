@@ -10,7 +10,7 @@
 # typing
 # scikit-image
 # huggingface_hub
-vtransformers>=4.39.1
+# transformers>=4.39.1
 # gradio
 # gradio_imageslider
 # loadimg>=0.1.1
